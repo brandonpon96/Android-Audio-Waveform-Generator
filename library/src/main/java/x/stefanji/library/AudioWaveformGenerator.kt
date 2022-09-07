@@ -7,18 +7,16 @@ import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import kotlinx.coroutines.GlobalScope
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import kotlin.math.pow
 import kotlin.math.sqrt
+import kotlinx.coroutines.launch
 
-
-/**
- * 音乐文件音量波形图数据生成器
- *
- * @param path 音乐文件的绝对路径
- * @param expectPoints 期望最终绘制多少个点
- */
 class AudioWaveformGenerator(
     private val path: String,
     private val expectPoints: Int
@@ -27,6 +25,9 @@ class AudioWaveformGenerator(
     private val handler = Handler(thread.looper)
     private var decoder: MediaCodec? = null
     private var extractor: MediaExtractor? = null
+    private var outputcounter = 0
+    private var inputcounter = 0
+    private var starttime = 0L
 
     @Volatile
     private var started = false
@@ -44,6 +45,7 @@ class AudioWaveformGenerator(
                 decoder = MediaCodec.createDecoderByType(mime).also {
                     it.configure(format, null, null, 0)
                     it.setCallback(this)
+                    starttime = System.currentTimeMillis()
                     it.start()
                 }
                 started = true
@@ -80,6 +82,7 @@ class AudioWaveformGenerator(
     private var totalSamples = 0L
     private var durationS = 0L
     private var perSamplePoints = 0L
+    private var barsCount = 0
 
     override fun onOutputBufferAvailable(
         codec: MediaCodec,
@@ -87,6 +90,7 @@ class AudioWaveformGenerator(
         info: MediaCodec.BufferInfo
     ) {
         if (info.size > 0) {
+            //Log.e("somethingcool", "output buffer " + outputcounter + ", start processing: " + (System.currentTimeMillis() - starttime))
             codec.getOutputBuffer(index)?.let { buf ->
                 val size = info.size
                 buf.position(info.offset)
@@ -101,8 +105,11 @@ class AudioWaveformGenerator(
                         handle32bit(size, buf)
                     }
                 }
-                codec.releaseOutputBuffer(index, false)
+                //Log.e("somethingcool", "output buffer " + outputcounter + ", finish rms: " + (System.currentTimeMillis() - starttime))
+                    codec.releaseOutputBuffer(index, false)
             }
+            //Log.e("somethingcool", "output buffer " + outputcounter + ", end processing: " + (System.currentTimeMillis() - starttime))
+            outputcounter++
         }
 
         if (info.isEof()) {
@@ -114,16 +121,23 @@ class AudioWaveformGenerator(
     override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
         if (inputEof) return
         val extractor = extractor ?: return
+        //Log.e("somethingcool", "input buffer " + inputcounter + ", start processing: " + (System.currentTimeMillis() - starttime))
         codec.getInputBuffer(index)?.let { buf ->
-            val size = extractor.readSampleData(buf, 0)
+            var size = extractor.readSampleData(buf, 0)
             if (size > 0) {
-                codec.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
+                GlobalScope.launch {
+                    codec.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
+                }
+                //Log.e("somethingcool", "input buffer " + inputcounter + ", queue buffer: " + (System.currentTimeMillis() - starttime))
+                extractor.advance()
                 extractor.advance()
             } else {
                 codec.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                 inputEof = true
             }
         }
+        //Log.e("somethingcool", "input buffer " + inputcounter + ", end processing: " + (System.currentTimeMillis() - starttime))
+        inputcounter++
     }
 
     override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
@@ -144,7 +158,7 @@ class AudioWaveformGenerator(
             16
         }
         totalSamples = sampleRate.toLong() * durationS
-        perSamplePoints = totalSamples / expectPoints
+        perSamplePoints = totalSamples / expectPoints / 2
     }
 
     override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
@@ -155,6 +169,8 @@ class AudioWaveformGenerator(
     private val sampleData = ArrayList<Float>()
     private var sampleCount = 0L
     private var sampleSum = 0.0
+    val sampleDataLiveData: MutableLiveData<ArrayList<Float>>
+        get() = MutableLiveData((sampleData))
 
     private fun calRMS(left: Float) {
         if (sampleCount == perSamplePoints) {
@@ -162,6 +178,11 @@ class AudioWaveformGenerator(
             sampleData.add(rms.toFloat())
             sampleCount = 0
             sampleSum = 0.0
+            barsCount++
+            if (barsCount == 10) {
+                sampleDataLiveData.postValue(sampleData)
+                barsCount = 0
+            }
         }
 
         sampleCount++
@@ -170,19 +191,16 @@ class AudioWaveformGenerator(
 
     private fun handle8bit(size: Int, buf: ByteBuffer) {
         repeat(size / if (channels == 2) 2 else 1) {
-            // 左声道
-            // 8 位采样的范围是: -128 ~ 128
             val left = buf.get().toInt() / 128f
-            if (channels == 2) {
-                buf.get()
-            }
+//            if (channels == 2) {
+//                buf.get()
+//            }
             calRMS(left)
         }
     }
 
     private fun handle16bit(size: Int, buf: ByteBuffer) {
         repeat(size / if (channels == 2) 4 else 2) {
-            // 左声道
             val a = buf.get().toInt()
             val b = buf.get().toInt() shl 8
             // 16 位采样的范围是: -32768 ~ 32768
@@ -204,12 +222,12 @@ class AudioWaveformGenerator(
             val d = buf.get().toLong() shl 24
             // 32 位采样的范围是: -2147483648 ~ 2147483648
             val left = (a or b or c or d) / 2147483648f
-            if (channels == 2) {
-                buf.get()
-                buf.get()
-                buf.get()
-                buf.get()
-            }
+//            if (channels == 2) {
+//                buf.get()
+//                buf.get()
+//                buf.get()
+//                buf.get()
+//            }
             calRMS(left)
         }
     }
